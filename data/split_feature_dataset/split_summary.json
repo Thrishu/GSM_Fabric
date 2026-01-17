@@ -1,0 +1,18 @@
+{
+  "total_samples": 177,
+  "features_count": 64,
+  "train_samples": 123,
+  "val_samples": 27,
+  "test_samples": 27,
+  "train_percentage": 69.49152542372882,
+  "val_percentage": 15.254237288135593,
+  "test_percentage": 15.254237288135593,
+  "gsm_range": [
+    85.0,
+    297.0
+  ],
+  "train_gsm_mean": 156.10569105691056,
+  "val_gsm_mean": 158.33333333333334,
+  "test_gsm_mean": 153.2962962962963,
+  "random_seed": 42
+}
