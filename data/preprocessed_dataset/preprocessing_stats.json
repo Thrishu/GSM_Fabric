@@ -1,0 +1,19 @@
+{
+  "original_sizes": "177 unique sizes recorded",
+  "processed_count": 177,
+  "failed_count": 0,
+  "target_size": [
+    512,
+    512
+  ],
+  "maintain_aspect": true,
+  "apply_padding": true,
+  "original_size_stats": {
+    "min_width": 640,
+    "max_width": 640,
+    "mean_width": 640.0,
+    "min_height": 480,
+    "max_height": 480,
+    "mean_height": 480.0
+  }
+}
