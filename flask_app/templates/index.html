@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hybrid GSM Predictor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Fabric GSM Predictor</h1>
+            <p>Upload a microscopic image or use your camera to predict GSM.</p>
+        </header>
+
+        <main>
+            <!-- Tabs -->
+            <div class="tabs">
+                <button class="tab-btn active" onclick="showTab('upload')">Upload Image</button>
+                <button class="tab-btn" onclick="showTab('camera')">Use Camera</button>
+            </div>
+
+            <!-- Upload Section -->
+            <div id="upload" class="tab-content active">
+                <form action="/" method="post" enctype="multipart/form-data" class="upload-form"
+                    onsubmit="showLoading()">
+                    <div class="file-drop-area">
+                        <span class="fake-btn">Choose Image</span>
+                        <span class="file-msg">or drag and drop file here</span>
+                        <input class="file-input" type="file" name="file" accept="image/*" required>
+                    </div>
+                    <button type="submit" class="submit-btn" id="upload-btn">Predict GSM</button>
+                </form>
+            </div>
+
+            <!-- Camera Section -->
+            <div id="camera" class="tab-content">
+                <div class="camera-container">
+                    <video id="video" autoplay playsinline></video>
+                    <canvas id="canvas" style="display:none;"></canvas>
+                </div>
+                <button id="snap" class="submit-btn" onclick="capture()">Capture & Predict</button>
+            </div>
+
+            <!-- Results Section -->
+            {% if prediction %}
+            <div class="result-card">
+                <h2>Prediction Result</h2>
+                <div class="gsm-value">{{ prediction }}</div>
+
+                {% if image_url %}
+                <img src="{{ image_url }}" alt="Analyzed Image" class="result-img">
+                {% endif %}
+
+                <details>
+                    <summary>View Extracted Features</summary>
+                    <div class="features-grid">
+                        {% for key, value in features.items() %}
+                        <div class="feature-item">
+                            <span class="key">{{ key }}</span>
+                            <span class="val">{{ "%.2f"|format(value) if value is number else value }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </details>
+            </div>
+            {% endif %}
+
+            {% if error %}
+            <div class="error-msg">
+                <strong>Error:</strong> {{ error }}
+            </div>
+            {% endif %}
+
+            <!-- JavaScript Result Container for Camera -->
+            <div id="js-result" class="result-card" style="display:none;">
+                <h2>Prediction Result</h2>
+                <div class="gsm-value" id="js-gsm"></div>
+                <details>
+                    <summary>View Extracted Features</summary>
+                    <div class="features-grid" id="js-features"></div>
+                </details>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Tab Switching
+        function showTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            document.querySelector(`button[onclick="showTab('${tabId}')"]`).classList.add('active');
+
+            if (tabId === 'camera') startCamera();
+            else stopCamera();
+        }
+
+        // Camera Logic
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        let stream = null;
+
+        // File Input Logic (Show filename)
+        const fileInput = document.querySelector('.file-input');
+        const fileMsg = document.querySelector('.file-msg');
+
+        fileInput.addEventListener('change', function () {
+            if (this.files && this.files.length > 0) {
+                fileMsg.textContent = this.files[0].name;
+            } else {
+                fileMsg.textContent = 'or drag and drop file here';
+            }
+        });
+
+        function showLoading() {
+            const btn = document.getElementById('upload-btn');
+            btn.innerText = "Analyzing... Please Wait";
+            btn.style.opacity = "0.7";
+            btn.style.cursor = "wait";
+        }
+
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                video.srcObject = stream;
+            } catch (err) {
+                console.error("Error accessing camera: ", err);
+                alert("Cannot access camera. Please allow permissions.");
+            }
+        }
+
+        function stopCamera() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+        }
+
+        function capture() {
+            const context = canvas.getContext('2d');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            const dataURL = canvas.toDataURL('image/jpeg');
+
+            document.getElementById('snap').innerText = "Processing...";
+
+            fetch('/predict_camera', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: dataURL })
+            })
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('snap').innerText = "Capture & Predict";
+                    if (data.error) {
+                        alert(data.error);
+                    } else {
+                        document.getElementById('js-result').style.display = 'block';
+                        document.getElementById('js-gsm').innerText = data.gsm + " GSM";
+
+                        const featsDiv = document.getElementById('js-features');
+                        featsDiv.innerHTML = '';
+                        for (const [key, value] of Object.entries(data.features)) {
+                            const val = typeof value === 'number' ? value.toFixed(2) : value;
+                            featsDiv.innerHTML += `
+                            <div class="feature-item">
+                                <span class="key">${key}</span>
+                                <span class="val">${val}</span>
+                            </div>`;
+                        }
+                    }
+                })
+                .catch(err => {
+                    console.error(err);
+                    document.getElementById('snap').innerText = "Capture & Predict";
+                    alert("Error getting prediction");
+                });
+        }
+    </script>
+</body>
+
+</html>
