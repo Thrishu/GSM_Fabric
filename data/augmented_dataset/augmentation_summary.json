@@ -1,0 +1,42 @@
+{
+  "original_count": 177,
+  "augmented_count": 1062,
+  "increase_factor": 6.0,
+  "augmentations_per_image": 5,
+  "preserve_original": true,
+  "augmentation_types_used": [
+    "horizontal_flip",
+    "vertical_flip",
+    "rotate_90",
+    "rotate_180",
+    "rotate_270",
+    "brightness_up",
+    "brightness_down",
+    "contrast_up",
+    "contrast_down",
+    "gaussian_noise",
+    "slight_blur",
+    "sharpen",
+    "zoom_in",
+    "zoom_out",
+    "gamma_correction"
+  ],
+  "augmentation_distribution": {
+    "original": 177,
+    "rotate_180": 74,
+    "gamma_correction": 66,
+    "vertical_flip": 64,
+    "rotate_270": 64,
+    "brightness_down": 63,
+    "slight_blur": 62,
+    "zoom_out": 61,
+    "contrast_down": 60,
+    "horizontal_flip": 58,
+    "sharpen": 57,
+    "rotate_90": 53,
+    "zoom_in": 52,
+    "contrast_up": 52,
+    "gaussian_noise": 51,
+    "brightness_up": 48
+  }
+}
