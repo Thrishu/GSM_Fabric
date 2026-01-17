@@ -1,0 +1,72 @@
+{
+  "app": {
+    "debug": false,
+    "host": "0.0.0.0",
+    "port": 5000,
+    "threaded": true,
+    "max_content_length_mb": 16,
+    "upload_folder": "uploads",
+    "allowed_extensions": ["png", "jpg", "jpeg", "bmp", "tiff"]
+  },
+  "model": {
+    "type": "catboost_regressor",
+    "model_path": "../Model/gsm_regressor.pt",
+    "scaler_path": "../Model/scaler.pkl",
+    "device": "cpu"
+  },
+  "image_processing": {
+    "target_size": [512, 512],
+    "maintain_aspect_ratio": true,
+    "apply_padding": true,
+    "padding_color": [255, 255, 255],
+    "image_quality": 95
+  },
+  "feature_extraction": {
+    "extract_thread_count": true,
+    "extract_yarn_density": true,
+    "extract_thread_spacing": true,
+    "extract_texture_features": true,
+    "extract_frequency_features": true,
+    "extract_structure_features": true,
+    "extract_edge_features": true,
+    "extract_color_features": true,
+    "total_features": 64
+  },
+  "prediction": {
+    "confidence_threshold_high": 50,
+    "confidence_threshold_medium": 300,
+    "min_valid_gsm": 0,
+    "max_valid_gsm": 500
+  },
+  "api": {
+    "timeout_seconds": 30,
+    "max_batch_size": 100,
+    "rate_limit_enabled": false,
+    "rate_limit_requests_per_minute": 60
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file": "app.log",
+    "max_file_size_mb": 10,
+    "backup_count": 5
+  },
+  "cors": {
+    "enabled": false,
+    "allowed_origins": ["http://localhost:5000"],
+    "allowed_methods": ["GET", "POST"],
+    "allowed_headers": ["Content-Type"]
+  },
+  "security": {
+    "secure_uploads": true,
+    "validate_file_headers": true,
+    "max_filename_length": 255,
+    "enable_csrf_protection": false
+  },
+  "performance": {
+    "use_gpu_if_available": false,
+    "num_workers": 4,
+    "cache_predictions": false,
+    "cache_ttl_seconds": 3600
+  }
+}

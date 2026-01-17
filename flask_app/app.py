@@ -1,300 +1,400 @@
-
 import os
 import sys
-import torch
-import torch.nn as nn
-import pandas as pd
+import io
+import json
+import pickle
 import numpy as np
-from flask import Flask, request, jsonify, render_template, redirect, url_for
-from werkzeug.utils import secure_filename
-from sklearn.preprocessing import RobustScaler
-from PIL import Image
-from torchvision import models, transforms
+import pandas as pd
 import cv2
+from pathlib import Path
+from PIL import Image
+from flask import Flask, render_template, request, jsonify
+from werkzeug.utils import secure_filename
+import base64
+from datetime import datetime
 
-# --- Configuration ---
-UPLOAD_FOLDER = 'static/uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-MODEL_PATH = '../Model/gsm_regressor.pt'  # Path relative to flask_app/
-DATA_PATH = '../augmented_features_dataset/dataset_train.csv' # Path to training data for scaler fitting
+# Import local feature extraction module
+from extract_fabric_features import extract_all_fabric_features_single_image
 
-# Add parent directory to path to import extraction script
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-try:
-    from extract_fabric_features import (
-        extract_thread_count, extract_yarn_density, extract_thread_spacing,
-        extract_texture_features, extract_frequency_features, 
-        extract_structure_features, extract_edge_features, extract_color_features
-    )
-except ImportError:
-    print("Warning: extract_fabric_features.py not found in parent directory. Copy it to the same folder if running standalone.")
-
+# Flask app initialization
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- Device Configuration ---
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff'}
 
-# --- Model Definition (Must match training architecture) ---
-class HybridGSMPredictor(nn.Module):
-    def __init__(self, num_features, dropout=0.5):
-        super(HybridGSMPredictor, self).__init__()
-        # Pre-trained EfficientNet-B3 backbone
-        efficientnet = models.efficientnet_b3(weights=None) # Weights loaded from .pth
-        
-        # Remove classifier head
-        self.cnn_features = nn.Sequential(*list(efficientnet.children())[:-1])
-        cnn_feature_size = 1536
+# Model and scaler paths
+MODEL_PATH = Path(__file__).parent.parent / 'Model' / 'best_model (1).pt'  # Using gsm_regressor.pt
+SCALER_PATH = Path(__file__).parent.parent / 'Model' / 'scaler.pkl'
 
-        # Feature processing branch
-        self.feature_branch = nn.Sequential(
-            nn.Linear(num_features, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout/2)
-        )
-
-        # Fusion and prediction head
-        combined_size = cnn_feature_size + 128
-        self.fusion = nn.Sequential(
-            nn.Linear(combined_size, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(dropout/2),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, images, features):
-        cnn_out = self.cnn_features(images)
-        cnn_out = torch.flatten(cnn_out, 1)
-        feat_out = self.feature_branch(features)
-        combined = torch.cat([cnn_out, feat_out], dim=1)
-        output = self.fusion(combined)
-        return output.squeeze()
-
-# --- Global State ---
+# Global variables for model and scaler
 model = None
 scaler = None
-feature_columns = []
+feature_names = None
 
-# --- Helper Functions ---
+def load_model_and_scaler():
+    """Load the PyTorch CNN model and scaler from checkpoint."""
+    global model, scaler, feature_names
+    
+    try:
+        import torch
+        import torch.nn as nn
+        import timm
+        
+        # Load model
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        
+        print("Loading PyTorch checkpoint...")
+        checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+        
+        print(f"Checkpoint type: {type(checkpoint)}")
+        if isinstance(checkpoint, dict):
+            print(f"Checkpoint keys: {checkpoint.keys()}")
+        
+        # Define model architecture - MUST MATCH CHECKPOINT EXACTLY (uses timm)
+        class EfficientNetGSMPredictor(nn.Module):
+            """EfficientNet-B3 model for GSM prediction using timm."""
+            def __init__(self, backbone_name='efficientnet_b3'):
+                super(EfficientNetGSMPredictor, self).__init__()
+                # Create backbone with timm (matches Colab notebook)
+                self.backbone = timm.create_model(
+                    backbone_name,
+                    pretrained=False,
+                    num_classes=0,  # Remove classifier
+                    global_pool='avg'  # Global average pooling
+                )
+                # Simple prediction head: 1536 -> 1
+                self.head = nn.Sequential(
+                    nn.Dropout(0.2),
+                    nn.Linear(self.backbone.num_features, 1)
+                )
+            
+            def forward(self, images):
+                cnn_out = self.backbone(images)
+                output = self.head(cnn_out)
+                return output.squeeze()
+        
+        # Load checkpoint and reconstruct model
+        model_loaded = False
+        scaler_loaded = False
+        
+        if isinstance(checkpoint, dict):
+            # Check for model_state or model_state_dict
+            model_state_dict = None
+            feature_cols = None
+            
+            if 'model_state_dict' in checkpoint:
+                print("Found 'model_state_dict' in checkpoint")
+                model_state_dict = checkpoint['model_state_dict']
+                feature_cols = checkpoint.get('feature_cols', [])
+            elif 'model_state' in checkpoint:
+                print("Found 'model_state' in checkpoint")
+                model_state_dict = checkpoint['model_state']
+                # Try to infer feature count from state dict
+                # Look for the first Linear layer input size in feature_branch
+                for key in model_state_dict.keys():
+                    if 'feature_branch.0.weight' in key:
+                        # This is the first linear layer: Linear(num_features, 256)
+                        feature_cols = list(range(model_state_dict[key].shape[1]))
+                        print(f"Inferred {len(feature_cols)} features from state dict")
+                        break
+            
+            if model_state_dict is not None:
+                try:
+                    print(f"Creating EfficientNet-B3 model (checkpoint has 'backbone' and 'head')...")
+                    # Initialize EfficientNet-B3 model matching Colab
+                    model = EfficientNetGSMPredictor(backbone_name='efficientnet_b3')
+                    
+                    # Load state dict with strict=False
+                    incompatible_keys = model.load_state_dict(model_state_dict, strict=False)
+                    if incompatible_keys.missing_keys:
+                        print(f"[WARNING] Missing keys: {len(incompatible_keys.missing_keys)}")
+                    if incompatible_keys.unexpected_keys:
+                        print(f"[WARNING] Unexpected keys: {len(incompatible_keys.unexpected_keys)}")
+                    
+                    model.eval()  # Set to evaluation mode
+                    print(f"[OK] Model loaded successfully")
+                    model_loaded = True
+                    
+                    # Extract scaler from checkpoint if available
+                    if 'scaler' in checkpoint:
+                        scaler = checkpoint['scaler']
+                        print(f"[OK] Scaler loaded from checkpoint")
+                        scaler_loaded = True
+                
+                except Exception as e:
+                    print(f"[ERROR] Error loading model: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    model = None
+            else:
+                print(f"[WARNING] No model state found in checkpoint. Available keys: {list(checkpoint.keys())}")
+                model = None
+        else:
+            # Try direct model loading
+            model = checkpoint
+            print(f"[OK] Loaded checkpoint directly")
+            model_loaded = True
+        
+        # Load scaler if not already loaded
+        if not scaler_loaded:
+            if SCALER_PATH.exists():
+                with open(SCALER_PATH, 'rb') as f:
+                    scaler = pickle.load(f)
+                print(f"[OK] Scaler loaded from: {SCALER_PATH}")
+                scaler_loaded = True
+            else:
+                # Create from dataset
+                augmented_csv = Path(__file__).parent.parent / 'data' / 'augmented_features_dataset' / 'dataset_train.csv'
+                if augmented_csv.exists():
+                    df = pd.read_csv(augmented_csv)
+                    meta_cols = ['image_name', 'gsm', 'source', 'augmentation', 'original_image', 'split']
+                    feature_names = [col for col in df.columns if col not in meta_cols]
+                    
+                    from sklearn.preprocessing import RobustScaler
+                    scaler = RobustScaler()
+                    scaler.fit(df[feature_names])
+                    
+                    # Save scaler for future use
+                    with open(SCALER_PATH, 'wb') as f:
+                        pickle.dump(scaler, f)
+                    print(f"[OK] Scaler created from dataset and saved")
+                    scaler_loaded = True
+                else:
+                    print("[WARNING] Scaler not found and cannot create from dataset")
+        
+        # Verify model is properly loaded
+        if not model_loaded or model is None:
+            print("[ERROR] Model failed to load properly")
+            return False
+        
+        if isinstance(model, dict):
+            print("[ERROR] Model is still a dict, cannot be used for predictions")
+            print(f"Model type: {type(model)}, keys: {list(model.keys()) if isinstance(model, dict) else 'N/A'}")
+            model = None
+            return False
+        
+        print(f"[OK] Model type: {type(model)}")
+        print(f"[OK] Model loaded successfully from: {MODEL_PATH}")
+        print(f"[OK] Scaler loaded successfully")
+        return True
+    
+    except Exception as e:
+        print(f"[ERROR] Error loading model: {str(e)}")
+        return False
+
 def allowed_file(filename):
+    """Check if file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def load_resources():
-    global model, scaler, feature_columns
-    
-    # 1. Load Data for Scaler
-    print("Loading dataset for scaler fitting...")
-    if os.path.exists(DATA_PATH):
-        df = pd.read_csv(DATA_PATH)
-        # Identify feature columns (exclude metadata)
-        meta_cols = ['image_name', 'gsm', 'source', 'augmentation', 'original_image', 'split']
-        feature_columns = [col for col in df.columns if col not in meta_cols]
-        
-        # Handle missing/zero-var same as training
-        for col in feature_columns:
-            if df[col].isna().any():
-                df[col] = df[col].fillna(df[col].median())
-        
-        scaler = RobustScaler()
-        scaler.fit(df[feature_columns])
-        print(f"Scaler fitted on {len(feature_columns)} features.")
-    else:
-        print(f"Error: Data file not found at {DATA_PATH}. Feature scaling will fail.")
-        return
-
-    # 2. Load Model
-    print("Loading PyTorch model...")
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = HybridGSMPredictor(num_features=len(feature_columns))
-            checkpoint = torch.load(MODEL_PATH, map_location=device)
-            
-            # Handle different checkpoint formats
-            if isinstance(checkpoint, dict):
-                # Check for model_state key (custom checkpoint format)
-                if 'model_state' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state'])
-                # Check for state_dict key
-                elif 'state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['state_dict'])
-                # Otherwise try loading the dict directly as state_dict
-                else:
-                    model.load_state_dict(checkpoint)
-            else:
-                # Checkpoint is the model object itself
-                model = checkpoint
-            
-            model.to(device)
-            model.eval()
-            print("Model loaded successfully.")
-        except Exception as e:
-             print(f"Failed to load model: {e}")
-    else:
-        print(f"Error: Model file not found at {MODEL_PATH}")
-
-def extract_features_from_image(img_path):
-    # This mimics the logic in extract_fabric_features.process_single_image
-    # But runs sequentially for a single image
-    img = cv2.imread(img_path)
-    if img is None:
-        return None
-    
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    features = {}
-    
+def preprocess_image(image_path, target_size=(512, 512)):
+    """Preprocess image for feature extraction."""
     try:
-        features.update(extract_thread_count(img_gray, direction='horizontal'))
-        features.update(extract_thread_count(img_gray, direction='vertical'))
-    except: pass
-    
-    try: features.update(extract_yarn_density(img_gray))
-    except: pass
-    
-    try: features.update(extract_thread_spacing(img_gray))
-    except: pass
-    
-    try: features.update(extract_texture_features(img_gray))
-    except: pass
-    
-    try: features.update(extract_frequency_features(img_gray))
-    except: pass
-    
-    try: features.update(extract_structure_features(img_gray))
-    except: pass
-    
-    try: features.update(extract_edge_features(img_gray))
-    except: pass
-    
-    try: features.update(extract_color_features(img))
-    except: pass
-    
-    return features
-
-def preprocess_for_model(img_path, features_dict):
-    # 1. Image Preprocessing
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    image = Image.open(img_path).convert('RGB')
-    image_tensor = transform(image).unsqueeze(0).to(device) # Batch dimension
-    
-    # 2. Feature Preprocessing
-    # Ensure all columns exist, fill missing with 0 (or some default if scaler expects it)
-    # The scaler expects specific columns in order
-    feature_vector = []
-    
-    # We must construct the vector in agreement with 'feature_columns'
-    for col in feature_columns:
-        val = features_dict.get(col, 0.0) # Default to 0 if extraction failed/missing
-        if pd.isna(val): val = 0.0
-        feature_vector.append(val)
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return None
         
-    feature_array = np.array([feature_vector])
-    scaled_features = scaler.transform(feature_array)
-    features_tensor = torch.tensor(scaled_features, dtype=torch.float32).to(device)
-    
-    return image_tensor, features_tensor
+        # Convert to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Resize with aspect ratio preservation
+        height, width = img.shape[:2]
+        scale = min(target_size[0] / width, target_size[1] / height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        img_resized = cv2.resize(img, (new_width, new_height))
+        
+        # Add padding
+        top = (target_size[1] - new_height) // 2
+        bottom = target_size[1] - new_height - top
+        left = (target_size[0] - new_width) // 2
+        right = target_size[0] - new_width - left
+        
+        img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, 
+                                       cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        
+        return img_padded
+    except Exception as e:
+        print(f"Error preprocessing image: {str(e)}")
+        return None
 
-# --- Routes ---
-@app.route('/', methods=['GET', 'POST'])
+def extract_features(image_path):
+    """Extract fabric features from image."""
+    try:
+        # Preprocess image
+        img = preprocess_image(image_path)
+        if img is None:
+            return None, "Failed to preprocess image"
+        
+        # Convert back to BGR for cv2
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        
+        # Extract features using the existing function
+        features_dict = extract_all_fabric_features_single_image(img_bgr)
+        
+        if features_dict is None:
+            return None, "Failed to extract features"
+        
+        return features_dict, None
+    
+    except Exception as e:
+        return None, f"Feature extraction error: {str(e)}"
+
+def predict_gsm(features_dict, image_path):
+    """Predict GSM value from image using PyTorch CNN model."""
+    try:
+        import torch
+        
+        if model is None:
+            return None, "Model not loaded"
+        
+        # Load and preprocess the image
+        IMG_SIZE = 352  # Standard EfficientNet input size
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return None, "Failed to load image for prediction"
+        
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        
+        # Normalize image to [0, 1]
+        img_normalized = img_resized.astype(np.float32) / 255.0
+        
+        # Convert to tensor (H, W, C) -> (C, H, W)
+        img_tensor = torch.from_numpy(img_normalized).permute(2, 0, 1).unsqueeze(0).float()
+        
+        # Apply ImageNet normalization (standard for pre-trained models)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        img_tensor = (img_tensor - mean) / std
+        
+        print(f"[DEBUG] Image tensor shape: {img_tensor.shape}, range: [{img_tensor.min():.4f}, {img_tensor.max():.4f}]")
+        
+        # Make prediction (model outputs raw GSM value, no denormalization needed)
+        with torch.no_grad():
+            prediction = model(img_tensor).item()
+        
+        print(f"[DEBUG] Raw prediction: {prediction:.2f} g/m²")
+        return float(prediction), None
+    
+    except Exception as e:
+        import traceback
+        print(f"Prediction error details: {traceback.format_exc()}")
+        return None, f"Prediction error: {str(e)}"
+
+@app.route('/')
 def index():
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            return render_template('index.html', error="No file part in request.")
-        file = request.files['file']
-        if file.filename == '':
-            return render_template('index.html', error="No file selected.")
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
-            
-            # Run Prediction
-            try:
-                print(f"Starting processing for {filename}...")
-                
-                # 1. Extract
-                print("Extracting features...")
-                raw_features = extract_features_from_image(filepath)
-                if not raw_features:
-                    print("Feature extraction failed.")
-                    return render_template('index.html', error="Failed to process image.")
-                print(f"Extracted {len(raw_features)} features.")
-                
-                # 2. Preprocess
-                print("Preprocessing image and features...")
-                
-                # DIAGNOSTIC: Check feature matching
-                missing_feats = []
-                for col in feature_columns:
-                    if col not in raw_features:
-                        missing_feats.append(col)
-                print(f"Model expects {len(feature_columns)} features. Missing in extraction: {len(missing_feats)}")
-                if len(missing_feats) > 0:
-                    print(f"First 5 missing: {missing_feats[:5]}")
-                
-                img_t, feat_t = preprocess_for_model(filepath, raw_features)
-                
-                # 3. Predict output
-                print("Running model inference...")
-                model.eval()  # FORCE EVAL MODE
-                print(f"Model training mode: {model.training}")
-                with torch.no_grad():
-                    prediction = model(img_t, feat_t).item()
-                print(f"Prediction: {prediction}")
-                
-                return render_template('index.html', 
-                                       prediction=f"{prediction:.2f} GSM", 
-                                       image_url=url_for('static', filename=f'uploads/{filename}'),
-                                       features=raw_features)
-            except Exception as e:
-                print(f"Error during processing: {e}")
-                return render_template('index.html', error=str(e))
-                
+    """Render main page."""
     return render_template('index.html')
 
-@app.route('/predict_camera', methods=['POST'])
-def predict_camera():
-    # Handle base64 image from camera
-    import base64
-    data = request.json
-    if 'image' not in data:
-        return jsonify({'error': 'No image data'}), 400
-        
-    image_data = data['image'].split(',')[1]
-    filename = 'camera_capture.jpg'
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    
-    with open(filepath, "wb") as fh:
-        fh.write(base64.b64decode(image_data))
-    
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """API endpoint for image prediction."""
     try:
-        raw_features = extract_features_from_image(filepath)
-        img_t, feat_t = preprocess_for_model(filepath, raw_features)
-        with torch.no_grad():
-            prediction = model(img_t, feat_t).item()
+        # Check if image is in request
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
         
-        return jsonify({'gsm': f"{prediction:.2f}", 'features': raw_features})
+        file = request.files['image']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type. Allowed: PNG, JPG, JPEG, BMP, TIFF'}), 400
+        
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], timestamp + filename)
+        file.save(filepath)
+        
+        # Extract features
+        features_dict, feature_error = extract_features(filepath)
+        if feature_error:
+            os.remove(filepath)
+            return jsonify({'error': feature_error}), 400
+        
+        # Predict GSM
+        gsm_prediction, predict_error = predict_gsm(features_dict, filepath)
+        if predict_error:
+            os.remove(filepath)
+            return jsonify({'error': predict_error}), 400
+        
+        # Return prediction
+        result = {
+            'success': True,
+            'gsm_prediction': gsm_prediction,
+            'confidence': 'High' if 50 <= gsm_prediction <= 300 else 'Medium',
+            'timestamp': datetime.now().isoformat(),
+            'filename': os.path.basename(filepath)
+        }
+        
+        return jsonify(result), 200
+    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Initialize
-load_resources()
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'model_loaded': model is not None,
+        'scaler_loaded': scaler is not None
+    }), 200
+
+@app.route('/api/batch-predict', methods=['POST'])
+def batch_predict():
+    """Batch prediction from multiple images."""
+    try:
+        if 'images' not in request.files:
+            return jsonify({'error': 'No images provided'}), 400
+        
+        files = request.files.getlist('images')
+        results = []
+        
+        for file in files:
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], timestamp + filename)
+                file.save(filepath)
+                
+                features_dict, _ = extract_features(filepath)
+                if features_dict:
+                    gsm_pred, _ = predict_gsm(features_dict, filepath)
+                    if gsm_pred:
+                        results.append({
+                            'filename': file.filename,
+                            'gsm_prediction': gsm_pred,
+                            'success': True
+                        })
+                    else:
+                        results.append({
+                            'filename': file.filename,
+                            'error': 'Prediction failed',
+                            'success': False
+                        })
+                
+                os.remove(filepath)
+        
+        return jsonify({
+            'total_processed': len(files),
+            'successful': sum(1 for r in results if r.get('success')),
+            'results': results
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    print("Loading model and scaler...")
+    if load_model_and_scaler():
+        print("[OK] Application ready!")
+        app.run(debug=True, host='0.0.0.0', port=5000)
+    else:
+        print("[ERROR] Failed to load model. Please check the model files.")
