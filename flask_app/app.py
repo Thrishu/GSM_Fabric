@@ -16,6 +16,11 @@ from datetime import datetime
 # Import local feature extraction module
 from extract_fabric_features import extract_all_fabric_features_single_image
 
+# Helper functions for log transformation
+def inverse_log_transform_gsm(gsm_log):
+    """Inverse log transformation: expm1(gsm_log) = exp(gsm_log) - 1"""
+    return np.expm1(gsm_log)
+
 # Flask app initialization
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
@@ -24,17 +29,155 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff'}
 
-# Model and scaler paths
-MODEL_PATH = Path(__file__).parent.parent / 'Model' / 'best_model (1).pt'  # Using gsm_regressor.pt
+# Model paths
+PYTORCH_MODEL_PATH = Path(__file__).parent.parent / 'Model' / 'best_model (1).pt'
+CATBOOST_MODEL_PATH = Path(__file__).parent.parent / 'Model' / 'catboost_baseline.cbm'
 SCALER_PATH = Path(__file__).parent.parent / 'Model' / 'scaler.pkl'
+FEATURE_SCALER_PATH = Path(__file__).parent.parent / 'Model' / 'feature_scaler.pkl'  # Scaler trained on exact CatBoost features
+
+# Configuration: Select which model to use ('pytorch' or 'catboost')
+MODEL_TYPE = 'pytorch'  # Change this to 'catboost' to use CatBoost model
 
 # Global variables for model and scaler
 model = None
 scaler = None
 feature_names = None
+current_model_type = None
 
 def load_model_and_scaler():
-    """Load the PyTorch CNN model and scaler from checkpoint."""
+    """Load model and scaler based on MODEL_TYPE configuration."""
+    global model, scaler, feature_names, current_model_type
+    
+    current_model_type = MODEL_TYPE
+    
+    if MODEL_TYPE.lower() == 'catboost':
+        return load_catboost_model()
+    elif MODEL_TYPE.lower() == 'pytorch':
+        return load_pytorch_model()
+    else:
+        print(f"[ERROR] Unknown MODEL_TYPE: {MODEL_TYPE}. Use 'pytorch' or 'catboost'")
+        return False
+
+def load_catboost_model():
+    """Load CatBoost model and feature scaler."""
+    global model, scaler, feature_names
+    
+    try:
+        from catboost import CatBoostRegressor
+        
+        # Check if model file exists
+        if not CATBOOST_MODEL_PATH.exists():
+            raise FileNotFoundError(f"CatBoost model file not found: {CATBOOST_MODEL_PATH}")
+        
+        print(f"Loading CatBoost model from: {CATBOOST_MODEL_PATH}")
+        model = CatBoostRegressor()
+        model.load_model(str(CATBOOST_MODEL_PATH), format='cbm')
+        print(f"[OK] CatBoost model loaded successfully")
+        
+        # Load feature scaler - this contains the exact features CatBoost was trained on
+        if FEATURE_SCALER_PATH.exists():
+            with open(FEATURE_SCALER_PATH, 'rb') as f:
+                scaler_data = pickle.load(f)
+            
+            # The pickle file might contain just the scaler or a dict with scaler + feature names
+            if isinstance(scaler_data, dict):
+                scaler = scaler_data.get('scaler', scaler_data)
+                feature_names = scaler_data.get('feature_names', None)
+                print(f"[OK] Loaded scaler and feature info from: {FEATURE_SCALER_PATH}")
+                if feature_names:
+                    print(f"[DEBUG] Scaler trained on {len(feature_names)} features")
+                    print(f"[DEBUG] Feature names (first 10): {feature_names[:10]}")
+            else:
+                scaler = scaler_data
+                print(f"[OK] Loaded scaler from: {FEATURE_SCALER_PATH}")
+                # Try to get feature count from scaler
+                if hasattr(scaler, 'n_features_in_'):
+                    print(f"[DEBUG] Scaler expects {scaler.n_features_in_} features")
+            
+            # If feature names still not loaded, infer from training data using correlation filtering
+            if feature_names is None:
+                print("[DEBUG] Feature names not in pickle, inferring from training data with correlation filtering...")
+                augmented_csv = Path(__file__).parent.parent / 'split_feature_dataset' / 'train' / 'dataset_train.csv'
+                if augmented_csv.exists():
+                    df = pd.read_csv(augmented_csv)
+                    meta_cols = ['image_name', 'gsm', 'source']
+                    all_features = [col for col in df.columns if col not in meta_cols]
+                    
+                    print(f"[DEBUG] Initial features from CSV: {len(all_features)}")
+                    
+                    # Apply filtering: remove near-constant features (variance < 0.01)
+                    variance_threshold = 0.01
+                    feature_variance = df[all_features].var()
+                    constant_features = feature_variance[feature_variance < variance_threshold].index.tolist()
+                    filtered_features = [f for f in all_features if f not in constant_features]
+                    
+                    print(f"[DEBUG] After removing constant features ({len(constant_features)} removed): {len(filtered_features)}")
+                    
+                    # Remove highly correlated features (correlation > 0.95) - SAME AS TRAINING
+                    correlation_threshold = 0.95
+                    corr_matrix = df[filtered_features].corr().abs()
+                    upper = corr_matrix.where(
+                        np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+                    )
+                    drop_cols = [column for column in upper.columns if any(upper[column] > correlation_threshold)]
+                    feature_names = [f for f in filtered_features if f not in drop_cols]
+                    
+                    print(f"[DEBUG] After removing correlated features ({len(drop_cols)} removed): {len(feature_names)}")
+                    print(f"[DEBUG] Final feature set: {feature_names}")
+                else:
+                    raise FileNotFoundError(f"Training dataset not found at {augmented_csv}")
+        else:
+            print(f"[WARNING] Feature scaler not found at: {FEATURE_SCALER_PATH}")
+            print(f"[WARNING] Inferring features from training dataset...")
+            
+            # Load from training dataset and apply same filtering as training
+            augmented_csv = Path(__file__).parent.parent / 'split_feature_dataset' / 'train' / 'dataset_train.csv'
+            if augmented_csv.exists():
+                df = pd.read_csv(augmented_csv)
+                meta_cols = ['image_name', 'gsm', 'source']
+                all_features = [col for col in df.columns if col not in meta_cols]
+                
+                print(f"[DEBUG] Initial features from CSV: {len(all_features)}")
+                
+                # Apply filtering: remove near-constant features
+                variance_threshold = 0.01
+                feature_variance = df[all_features].var()
+                constant_features = feature_variance[feature_variance < variance_threshold].index.tolist()
+                filtered_features = [f for f in all_features if f not in constant_features]
+                
+                print(f"[DEBUG] After removing constant features: {len(filtered_features)}")
+                
+                # Remove highly correlated features
+                correlation_threshold = 0.95
+                corr_matrix = df[filtered_features].corr().abs()
+                upper = corr_matrix.where(
+                    np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+                )
+                drop_cols = [column for column in upper.columns if any(upper[column] > correlation_threshold)]
+                feature_names = [f for f in filtered_features if f not in drop_cols]
+                
+                print(f"[DEBUG] After removing correlated features: {len(feature_names)}")
+                
+                # Create scaler from selected features
+                from sklearn.preprocessing import StandardScaler
+                scaler = StandardScaler()
+                scaler.fit(df[feature_names])
+                print(f"[OK] Created scaler from dataset with {len(feature_names)} features")
+            else:
+                print("[ERROR] Cannot load training dataset")
+                return False
+        
+        print(f"[OK] CatBoost model loaded with {len(feature_names) if feature_names else 'unknown'} features")
+        return True
+    
+    except Exception as e:
+        print(f"[ERROR] Error loading CatBoost model: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def load_pytorch_model():
+    """Load PyTorch CNN model and scaler from checkpoint."""
     global model, scaler, feature_names
     
     try:
@@ -43,11 +186,11 @@ def load_model_and_scaler():
         import timm
         
         # Load model
-        if not MODEL_PATH.exists():
-            raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        if not PYTORCH_MODEL_PATH.exists():
+            raise FileNotFoundError(f"Model file not found: {PYTORCH_MODEL_PATH}")
         
         print("Loading PyTorch checkpoint...")
-        checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+        checkpoint = torch.load(PYTORCH_MODEL_PATH, map_location='cpu')
         
         print(f"Checkpoint type: {type(checkpoint)}")
         if isinstance(checkpoint, dict):
@@ -177,12 +320,12 @@ def load_model_and_scaler():
             return False
         
         print(f"[OK] Model type: {type(model)}")
-        print(f"[OK] Model loaded successfully from: {MODEL_PATH}")
+        print(f"[OK] PyTorch model loaded successfully from: {PYTORCH_MODEL_PATH}")
         print(f"[OK] Scaler loaded successfully")
         return True
     
     except Exception as e:
-        print(f"[ERROR] Error loading model: {str(e)}")
+        print(f"[ERROR] Error loading PyTorch model: {str(e)}")
         return False
 
 def allowed_file(filename):
@@ -232,8 +375,8 @@ def extract_features(image_path):
         # Convert back to BGR for cv2
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         
-        # Extract features using the existing function
-        features_dict = extract_all_fabric_features_single_image(img_bgr)
+        # Extract features using the existing function (with debug=True for troubleshooting)
+        features_dict = extract_all_fabric_features_single_image(img_bgr, debug=True)
         
         if features_dict is None:
             return None, "Failed to extract features"
@@ -244,12 +387,87 @@ def extract_features(image_path):
         return None, f"Feature extraction error: {str(e)}"
 
 def predict_gsm(features_dict, image_path):
+    """Predict GSM value using the selected model (PyTorch CNN or CatBoost)."""
+    if current_model_type == 'catboost':
+        return predict_gsm_catboost(features_dict, image_path)
+    elif current_model_type == 'pytorch':
+        return predict_gsm_pytorch(features_dict, image_path)
+    else:
+        return None, f"Unknown model type: {current_model_type}"
+
+def predict_gsm_catboost(features_dict, image_path):
+    """Predict GSM value from features using CatBoost model."""
+    try:
+        if model is None:
+            return None, "CatBoost model not loaded"
+        
+        if scaler is None:
+            return None, "Scaler not loaded"
+        
+        if feature_names is None or len(feature_names) == 0:
+            return None, "Feature names not available"
+        
+        # Create feature vector from extracted features
+        # Use mean imputation for missing features
+        feature_vector = []
+        extracted_features = 0
+        missing_features_list = []
+        
+        for fname in feature_names:
+            if fname in features_dict:
+                feature_vector.append(features_dict[fname])
+                extracted_features += 1
+            else:
+                # Track missing features
+                feature_vector.append(0.0)
+                missing_features_list.append(fname)
+        
+        feature_vector = np.array(feature_vector).reshape(1, -1)
+        
+        print(f"[DEBUG] Expected {len(feature_names)} features, got {extracted_features} extracted")
+        print(f"[DEBUG] Feature vector shape: {feature_vector.shape}")
+        print(f"[DEBUG] Feature vector range: [{feature_vector.min():.4f}, {feature_vector.max():.4f}]")
+        
+        if missing_features_list:
+            print(f"[WARNING] Missing {len(missing_features_list)} features: {missing_features_list}")
+        
+        # Debug: compare with scaler expectations
+        if hasattr(scaler, 'n_features_in_'):
+            print(f"[DEBUG] Scaler expects {scaler.n_features_in_} features, got {len(feature_names)}")
+        
+        # Scale features
+        try:
+            feature_vector_scaled = scaler.transform(feature_vector)
+        except Exception as e:
+            print(f"[ERROR] Scaler transform error: {str(e)}")
+            print(f"[ERROR] Feature names count: {len(feature_names)}")
+            print(f"[ERROR] Feature vector shape: {feature_vector.shape}")
+            if hasattr(scaler, 'n_features_in_'):
+                print(f"[ERROR] Scaler expects {scaler.n_features_in_} features")
+            return None, f"Feature scaling error: {str(e)}"
+        
+        # Make prediction with CatBoost
+        prediction = model.predict(feature_vector_scaled)[0]
+        
+        # Inverse log transform to get actual GSM value
+        gsm_prediction = inverse_log_transform_gsm(prediction)
+        
+        print(f"[DEBUG] CatBoost log prediction: {prediction:.4f}")
+        print(f"[DEBUG] CatBoost GSM prediction: {gsm_prediction:.2f} g/m²")
+        return float(gsm_prediction), None
+    
+    except Exception as e:
+        import traceback
+        print(f"CatBoost prediction error details: {traceback.format_exc()}")
+        return None, f"CatBoost prediction error: {str(e)}"
+
+def predict_gsm_pytorch(features_dict, image_path):
     """Predict GSM value from image using PyTorch CNN model."""
     try:
         import torch
         
         if model is None:
-            return None, "Model not loaded"
+            return None, "PyTorch model not loaded"
         
         # Load and preprocess the image
         IMG_SIZE = 352  # Standard EfficientNet input size
@@ -277,13 +495,13 @@ def predict_gsm(features_dict, image_path):
         with torch.no_grad():
             prediction = model(img_tensor).item()
         
-        print(f"[DEBUG] Raw prediction: {prediction:.2f} g/m²")
+        print(f"[DEBUG] PyTorch prediction: {prediction:.2f} g/m²")
         return float(prediction), None
     
     except Exception as e:
         import traceback
-        print(f"Prediction error details: {traceback.format_exc()}")
-        return None, f"Prediction error: {str(e)}"
+        print(f"PyTorch prediction error details: {traceback.format_exc()}")
+        return None, f"PyTorch prediction error: {str(e)}"
 
 @app.route('/')
 def index():
@@ -343,6 +561,78 @@ def health_check():
     """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
+        'model_type': current_model_type,
+        'model_loaded': model is not None,
+        'scaler_loaded': scaler is not None,
+        'feature_names_available': feature_names is not None
+    }), 200
+
+@app.route('/api/switch-model', methods=['POST'])
+def switch_model():
+    """Switch between PyTorch and CatBoost models."""
+    global model, scaler, feature_names, current_model_type, MODEL_TYPE
+    
+    try:
+        data = request.get_json()
+        new_model_type = data.get('model_type', '').lower()
+        
+        if new_model_type not in ['pytorch', 'catboost']:
+            return jsonify({'error': "Model type must be 'pytorch' or 'catboost'"}), 400
+        
+        if new_model_type == current_model_type:
+            return jsonify({
+                'message': f'Already using {new_model_type} model',
+                'current_model': current_model_type
+            }), 200
+        
+        # Update global MODEL_TYPE
+        MODEL_TYPE = new_model_type
+        
+        # Reset globals
+        model = None
+        scaler = None
+        feature_names = None
+        
+        # Load new model
+        print(f"\n[SWITCH] Switching from {current_model_type} to {new_model_type}...")
+        success = load_model_and_scaler()
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'Successfully switched to {new_model_type} model',
+                'current_model': current_model_type,
+                'model_loaded': model is not None,
+                'scaler_loaded': scaler is not None
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to load {new_model_type} model',
+                'current_model': current_model_type
+            }), 500
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/model-info', methods=['GET'])
+def model_info():
+    """Get information about available and current models."""
+    pytorch_available = PYTORCH_MODEL_PATH.exists()
+    catboost_available = CATBOOST_MODEL_PATH.exists()
+    
+    return jsonify({
+        'current_model': current_model_type,
+        'available_models': {
+            'pytorch': {
+                'available': pytorch_available,
+                'path': str(PYTORCH_MODEL_PATH)
+            },
+            'catboost': {
+                'available': catboost_available,
+                'path': str(CATBOOST_MODEL_PATH)
+            }
+        },
         'model_loaded': model is not None,
         'scaler_loaded': scaler is not None
     }), 200
